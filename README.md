@@ -9,7 +9,7 @@ A personal AI-powered second brain that remembers your tasks, projects, and peop
 You type naturally — "I need to book a venue for Priya's wedding by April 25" — and the system:
 
 - Creates a task with a deadline (`dueDate: 2026-04-25`)
-- Creates a project for the wedding
+- Creates a project for the Europe trip
 - Adds Priya to your people if she isn't there
 - Escalates priority as the deadline approaches (daily sweep at 8am)
 - Surfaces it as a recommendation on your Focus tab
