@@ -6,14 +6,14 @@ A personal AI-powered second brain that remembers your tasks, projects, and peop
 
 ## What it does
 
-You type naturally — "I need to book a venue for Priya's wedding by April 25" — and the system:
+You type naturally — "I need to plan my trip to Europe - flights, hotels, itinerary" — and the system:
 
 - Creates a task with a deadline (`dueDate: 2026-04-25`)
 - Creates a project for the Europe trip
-- Adds Priya to your people if she isn't there
+- Adds relevant people or places mentioned to your data
 - Escalates priority as the deadline approaches (daily sweep at 8am)
 - Surfaces it as a recommendation on your Focus tab
-- Asks one follow-up question if something is unclear ("What's Priya's last name?")
+- Asks one follow-up question if something is unclear ("Which cities are you visiting?")
 - Waits for your answer before saving data
 
 Everything is stored locally in JSON files. The only thing that leaves your machine is the message + context sent to Anthropic's API for AI processing.
