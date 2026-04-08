@@ -1,0 +1,120 @@
+PROJECT IDEA — A WINDOW INTO AI AGENT THOUGHT PROCESS
+======================================================
+
+One line:
+A transparency and memory layer that makes the thought process of autonomous AI agents
+readable, editable, and trustworthy by humans in real time.
+
+
+THE PROBLEM
+-----------
+AI agents are a black box. They take input, produce output, and everything in between —
+the reasoning, the plan, the decisions, the dead ends — disappears. You get the answer
+but not the thought.
+
+Most agent frameworks (LangChain, CrewAI, AutoGen) have no persistent shared state
+between runs. The agent either keeps everything in context (expensive, lossy) or starts
+fresh (loses everything).
+
+Long-running autonomous agents hit the same wall — great at short bursts, terrible at
+long-horizon work. The reason is always the same: no persistent, inspectable,
+human-editable state between runs.
+
+
+WHAT EXISTS AND WHY IT'S NOT ENOUGH
+-------------------------------------
+- LangSmith / LangFuse — logs agent traces, shows every LLM call. Observability for
+  debugging, not for understanding intent. You're reading stack traces, not thoughts.
+- AgentOps — monitoring and analytics for agent runs. Same problem.
+- AutoGen / CrewAI dashboards — show which agent talks to which. Operational visibility,
+  not cognitive visibility.
+
+None of them show what the agent was PLANNING, WHY it made a decision, or WHAT it
+intends to do next — in a form a human can read and react to. And none of them let you
+reach in and change it. They're read-only windows. Observation without participation.
+
+
+THE IDEA
+--------
+A shared working memory between the human and the agent. Not a chat interface —
+a task graph with a conversation layer on top.
+
+The agent writes its plans, progress, and reasoning into the system.
+The human reads it, tweaks it, redirects it.
+The agent reads the human's edits, reflects, and continues.
+
+The gap between autonomous runs is no longer a black box — it's a readable,
+editable task graph.
+
+It's not a task manager. It's legibility for AI cognition.
+It's not a productivity tool. It's a transparency layer.
+The problem with autonomous agents isn't capability — it's trust.
+You can't trust what you can't see. This builds the window.
+
+
+THE FLOW
+--------
+1. Agent starts a long-term project → writes planned tasks to the system
+   "Plan: research competitors → draft report → review findings → publish"
+
+2. Human sees the plan in the UI
+   → tweaks: "skip publishing, just send me the draft"
+   → system flags the change as human override
+
+3. Agent polls the system before next action
+   → sees the edit → reflects → adjusts remaining plan
+
+4. Agent completes a task → marks done, writes what it found
+   → system logs it, updates project status
+
+5. Gaps between tasks → system holds state
+   → human can see exactly where agent left off
+   → agent picks up exactly from where it left off
+
+
+KEY PRIMITIVES NEEDED
+---------------------
+- Agent identity         — which agent wrote this task
+- Task status: planned   — agent's intent before it acts (human can veto or tweak)
+- Task status: in_progress — agent is actively working on this
+- Reflection trigger     — when human edits a task, agent re-reasons
+- Plan diff              — what changed between original plan and current state
+- Audit trail            — every action logged with who did it (agent or human)
+- GET /api/context       — agent fetches its current task graph before acting
+- POST /api/agent/update — structured write, bypasses NLP layer
+- POST /api/reflect      — agent submits plan, gets back human edits + diff
+- Change flag            — human_modified: true so agent knows to re-evaluate
+
+
+WHY IT'S DEFENSIBLE
+-------------------
+- Agents doing multi-day/multi-week work is happening now. The infra to run them
+  exists. The infra to MANAGE them doesn't. That's the gap.
+- It's a developer tool — smaller but more willing-to-pay audience.
+- The conversation layer on top (human can just talk to understand/redirect) is
+  the moat. Any dev can build a task database. The natural language interface is harder.
+- Timing: slightly ahead of the need. Building for where agent usage is going,
+  not where it is today.
+
+
+WHAT ALREADY EXISTS AS A FOUNDATION (engine. codebase)
+------------------------------------------------------
+- Multi-agent pipeline with structured action output
+- REST API (POST /api/message, GET /api/data, etc.)
+- Qdrant semantic search — agents can query relevant context before acting
+- Structured storage — tasks, projects, people map directly to agent primitives
+- Journal — full audit trail of every action
+- Action executor — clean write layer, easy to extend with agentId
+- The NLP layer is just one interface — agents can bypass it and write directly
+
+
+RISKS
+-----
+- Agent frameworks may add this natively over time
+- Needs real agentic workloads to validate — not just humans using it
+- Developer tool positioning requires different GTM than consumer
+
+
+IN ONE LINE
+-----------
+Less like a debugger. More like being able to sit next to the agent and see its notepad.

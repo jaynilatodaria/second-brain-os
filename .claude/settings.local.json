@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(docker run:*)",
+      "Bash(docker start:*)",
+      "Bash(node:*)",
+      "Bash(ipconfig getifaddr:*)",
+      "Bash(curl -s -X POST http://localhost:3000/api/message/preview -H \"Content-Type: application/json\" -d '{\"\"message\"\":\"\"i need to call the dentist tomorrow\"\"}')",
+      "Read(//private/tmp/**)",
+      "Bash(lsof -ti:3001)",
+      "Bash(xargs kill:*)",
+      "Bash(lsof -ti:6333)",
+      "Bash(curl -s http://localhost:3001/api/health)",
+      "Bash(curl -s http://localhost:3000/api/health)",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"I am planning a trip to Udaipur for my sister''''s pre wedding photoshoot\"\"\"\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(e[''''title'''']\\) for e in d[''''entries'''']]\")",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"By the way my sisters name is Priya\"\"\"\"}')",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"Need to plan mums 60th birthday surprise party, thinking of a dinner at a nice restaurant with close family and friends, sometime in May\"\"\"\"}')",
+      "Bash(python3:*)",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"I need to renew my driving license by May 5, pretty urgent\"\"\"\"}')",
+      "Bash(lsof -ti:3000)",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"My sister is getting married in June, I need to start planning the wedding\"\"\"\"}')",
+      "Bash(curl -s -X POST http://localhost:3000/api/message -H \"Content-Type: application/json\" -d '{\"\"\"\"message\"\"\"\":\"\"\"\"Her name is Priya\"\"\"\"}')",
+      "Bash(echo {\"\"people\"\":[]})",
+      "Bash(echo {\"\"projects\"\":[]})",
+      "Bash(echo {\"\"entries\"\":[]})",
+      "Bash(echo {})",
+      "Bash(echo {\"\"history\"\":[]})"
+    ]
+  }
+}

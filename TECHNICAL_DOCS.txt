@@ -1,0 +1,1049 @@
+================================================================================
+  engine. — SECOND BRAIN OS — FULL TECHNICAL DOCUMENTATION
+================================================================================
+Last updated: 2026-03-31
+Stack: Node.js / Express / Qdrant / Anthropic API / OpenAI Embeddings / Vanilla JS
+
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1.  System Overview
+  2.  Architecture Diagram
+  3.  Data Model
+  4.  Information Flow — End to End
+  5.  Context Loading
+  6.  The Agent Pipeline
+      5a. People Agent
+      5b. Projects Agent
+      5c. Planning Agent
+      5d. Tasks Agent
+      5e. Composer Agent
+      5f. Recommendations Agent
+  7.  The ASK / Deferred Actions Flow
+  8.  Action Execution
+  9.  Deduplication Strategy
+  10. Deadline System
+  11. Scheduled Jobs (Cron)
+  12. Frontend — Tab Structure
+  13. API Reference
+  14. File Reference
+  15. Environment Variables
+  16. Key Constants and Tuning Parameters
+  17. Data Privacy
+  18. Known Behaviours and Edge Cases
+
+
+================================================================================
+  1. SYSTEM OVERVIEW
+================================================================================
+
+engine. is a personal second brain operated entirely through natural language chat.
+The user types messages as they would in a journal. A multi-agent AI pipeline
+interprets each message, decides what to create or update across tasks, projects,
+and people, and writes a concise reply.
+
+The system is built around three principles:
+
+  CAPTURE EVERYTHING
+  Every mention of a person, task, project, or deadline is extracted and stored
+  without the user having to explicitly ask. A message like "catching up with
+  Rahul on Thursday about the product roadmap" creates a person (Rahul), a task
+  (sync with Rahul on product roadmap), and notes the Thursday deadline — all
+  automatically.
+
+  ASK BEFORE SAVING
+  When the Composer agent decides a clarifying question is worth asking, all data
+  actions for that turn are held in a deferred queue. Nothing is written to
+  storage until the question is answered. This prevents saving partial or
+  incorrect data.
+
+  SURFACE PROACTIVELY
+  A recommendations agent runs twice daily and a deadline sweep runs every
+  morning. Both read structured data (dueDate fields, task status) and surface
+  what needs attention on the Focus tab — without the user having to ask.
+
+
+================================================================================
+  2. ARCHITECTURE DIAGRAM
+================================================================================
+
+  USER MESSAGE
+       │
+       ▼
+  routes/message.js  ──────────────────────────────────────────────────────────
+       │
+       │  Step 1: Load context
+       ▼
+  services/contextLoader.js
+       │  ├── Qdrant semantic search (top 8 tasks, 5 projects, 5 people)
+       │  ├── sessionContext.json  (last 10 turns)
+       │  └── pendingInquiry.json (active question if any)
+       │
+       │  Step 2: Multi-agent pipeline
+       ▼
+  services/orchestrator.js
+       │
+       ├── [parallel] agents/peopleAgent.js     → ADD_PERSON, UPDATE_PERSON
+       ├── [parallel] agents/projectsAgent.js   → ADD_PROJECT, UPDATE_PROJECT
+       │
+       ├── agents/planningAgent.js              → UPDATE_TASK (existing only)
+       │
+       ├── agents/tasksAgent.js                 → ADD_TASK, UPDATE_TASK
+       │
+       └── agents/composerAgent.js              → reply + optional ASK
+       │
+       │  Step 3: Execute actions
+       ▼
+  services/actionExecutor.js
+       │  ├── Writes to JSON files (memory.json, projects.json, people.json)
+       │  └── Async sync to Qdrant (fire-and-forget)
+       │
+       │  Step 4: Session + journal
+       ▼
+  sessionContext.json ← append turn
+  data/journal.md     ← append entry
+
+  CRON (independent of message flow):
+       ├── 8am  → services/deadlineSweep.js    (priority escalation, no AI)
+       ├── 9am  → agents/recommendationsAgent.js
+       └── 6pm  → agents/recommendationsAgent.js
+
+
+================================================================================
+  3. DATA MODEL
+================================================================================
+
+--- TASK (stored in data/memory.json → entries[]) ---
+
+  {
+    id:          string  (uuid v4)
+    title:       string  (actionable verb phrase)
+    status:      "active" | "done"
+    priority:    "high" | "medium" | "low"
+    dueDate:     string  (ISO date YYYY-MM-DD, optional)
+    project:     string  (exact project name, optional)
+    tags:        string[]
+    notes:       string  (context, blockers, deadline info)
+    _source:     string  (what triggered creation)
+    createdAt:   ISO timestamp
+    updatedAt:   ISO timestamp
+    completedAt: ISO timestamp  (set when status → done)
+  }
+
+--- PROJECT (stored in data/projects.json → projects[]) ---
+
+  {
+    id:          string  (uuid v4)
+    name:        string
+    description: string
+    status:      "planning" | "active" | "in_progress" | "done"
+    goals:       string[]
+    _source:     string
+    createdAt:   ISO timestamp
+    updatedAt:   ISO timestamp
+  }
+
+--- PERSON (stored in data/people.json → people[]) ---
+
+  {
+    id:           string  (uuid v4)
+    name:         string  (may be a relationship label e.g. "Sister" until real name known)
+    relationship: string  (e.g. "sister", "friend", "boss", "colleague")
+    role:         string  (optional, job title or function)
+    birthday:     string  (optional)
+    location:     string  (optional)
+    notes:        string  (accumulated context about this person)
+    _source:      object  (field-level source tracking)
+    createdAt:    ISO timestamp
+    updatedAt:    ISO timestamp
+  }
+
+--- PENDING INQUIRY (stored in data/pendingInquiry.json) ---
+
+  {
+    question:           string  (the question shown to the user)
+    context:            string  (why the question is being asked)
+    clarificationRound: number  (1 or 2 — max 2 per topic)
+    createdAt:          ISO timestamp
+    deferredActions:    Action[]  (data actions held until question answered)
+  }
+
+  File contains null when no question is active.
+
+--- SESSION CONTEXT (stored in data/sessionContext.json) ---
+
+  {
+    history: [
+      { ts: ISO, user: string, assistant: string },
+      ...  (max 10 entries, oldest dropped first)
+    ]
+  }
+
+--- RECOMMENDATIONS (stored in data/recommendations.json) ---
+
+  {
+    items: [
+      {
+        id:             string  (uuid)
+        project:        string | null
+        task:           string | null
+        insight:        string  (what was observed)
+        suggestion:     string  (actionable title)
+        priority:       "high" | "medium" | "low"
+        status:         "pending" | "task_created" | "dismissed" | "resolved"
+        taskId:         string | null  (linked task id if converted to task)
+        createdAt:      ISO timestamp
+        followUpAt:     ISO timestamp  (when to re-check)
+        escalationLevel: number  (increments each time followUpAt passes)
+      }
+    ],
+    generatedAt: ISO timestamp
+  }
+
+--- USAGE (stored in data/usage.json) ---
+
+  {
+    calls:         number
+    input_tokens:  number
+    output_tokens: number
+    cost_usd:      number
+    by_model: {
+      "claude-sonnet-4-6": { calls, input_tokens, output_tokens, cost_usd },
+      "claude-haiku-4-5-20251001": { ... }
+    },
+    updated_at: ISO timestamp
+  }
+
+
+================================================================================
+  4. INFORMATION FLOW — END TO END
+================================================================================
+
+A message passes through these stages in order:
+
+  STAGE 1 — CONTEXT LOAD (contextLoader.js)
+  Before any AI runs, the system fetches what the brain already knows.
+  Sends the message as a semantic query to Qdrant. Returns top-N similar records
+  from tasks, projects, people collections. Falls back to full JSON if Qdrant
+  is unavailable.
+
+  STAGE 2 — AGENT PIPELINE (orchestrator.js)
+  Five agents run in a fixed sequence. Each returns only JSON action objects —
+  no side effects at this stage. Actions accumulate across agents.
+
+  STAGE 3 — ACTION EXECUTION (actionExecutor.js)
+  All actions are executed against the JSON files. Fuzzy dedup prevents creating
+  duplicates. Qdrant is synced asynchronously (fire-and-forget).
+
+  STAGE 4 — SESSION + JOURNAL
+  The turn (user message + assistant reply) is appended to sessionContext.json
+  (capped at 10 turns) and journal.md (unbounded).
+
+  STAGE 5 — RESPONSE
+  The reply from Composer, plus all actions and execution log, are returned to
+  the frontend.
+
+  SPECIAL CASE — PREVIEW/CONFIRM
+  The frontend uses a two-step flow: POST /preview interprets the message and
+  shows the user what will happen. POST /confirm executes the pre-approved
+  actions. This means the user sees the AI's intent before data is written.
+  The /preview endpoint also accepts taskContext for task-specific chat.
+
+
+================================================================================
+  5. CONTEXT LOADING
+================================================================================
+
+File: backend/services/contextLoader.js
+
+The context loader runs before any agent and determines what data each agent
+will see. It attempts Qdrant semantic search first, then falls back to full JSON.
+
+  QDRANT PATH (query provided, Qdrant reachable):
+  - Embeds the message using OpenAI text-embedding-3-small (1536 dimensions)
+  - Searches: tasks (top 8), projects (top 5), people (top 5)
+  - Returns only the most semantically relevant records
+  - contextSource: "qdrant_search"
+
+  FALLBACK PATH (Qdrant unavailable or no query):
+  - Loads full memory.json, projects.json, people.json, projectState.json
+  - contextSource: "full_json"
+
+  ALWAYS LOADED (both paths):
+  - sessionContext.json (last 10 conversation turns)
+  - pendingInquiry.json (active question if any)
+
+  TUNING: The numbers 8, 5, 5 in contextLoader.js:14-16 control how many
+  records come from Qdrant. Increasing these improves recall but increases
+  token usage for every message.
+
+
+================================================================================
+  6. THE AGENT PIPELINE
+================================================================================
+
+File: backend/services/orchestrator.js
+
+The orchestrator runs five agents in sequence (people+projects in parallel).
+Each agent receives a "slice" of context — only what it needs, no more.
+Each agent returns { actions: [], reasoning: "" }.
+No agent writes to storage — that happens in actionExecutor after all agents finish.
+
+  IMPORTANT: No router agent. Each agent self-gates by returning actions: []
+  when the message is not relevant to its domain. This is more robust than
+  external routing because the agent has full context when making the decision.
+
+  IMPORTANT: Only the Composer agent can generate ASK/CLEAR_ASK actions.
+  Domain agents (people, projects, planning, tasks) are forbidden from asking
+  questions. Any ASK that leaks from a domain agent is stripped in orchestrator.js
+  before actions are merged.
+
+  CLARIFICATION BUDGET: Max 2 sequential clarifying questions per topic.
+  Tracked via clarificationRound in pendingInquiry. At round 2 the Composer
+  is forbidden from asking again. This prevents the system from becoming
+  interrogation-like.
+
+
+  -----------------------------------------------------------------------
+  5a. PEOPLE AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/peopleAgent.js
+  Model: claude-sonnet-4-6
+  Max tokens: 800
+
+  Context received:
+  - Full people list (from Qdrant or JSON)
+  - Task titles (for cross-referencing)
+  - Project names (for cross-referencing)
+  - Last 3 conversation turns
+
+  Actions available:
+  - ADD_PERSON    { name, role?, relationship?, birthday?, location?, notes?, _source? }
+  - UPDATE_PERSON { name, fields: { role?, relationship?, birthday?, location?, notes? } }
+
+  Key behaviours:
+  - DEDUP BY NAME AND RELATIONSHIP: Before creating a person, checks both name
+    and relationship fields. "My girlfriend" with an existing girlfriend entry
+    → UPDATE, not ADD.
+  - PLACEHOLDER CREATION: "My sister" with no matching person → ADD_PERSON
+    with name: "Sister", relationship: "sister". The Composer will then ask
+    for the real name.
+  - PLACEHOLDER RENAME: "Sister" placeholder + "Her name is Priya" →
+    UPDATE_PERSON { name: "Sister", fields: { name: "Priya" } }.
+  - CROSS-REFERENCE: When a project changes status (cancelled, done,
+    postponed), updates the notes of any person involved in that project,
+    even if they aren't mentioned in the current message.
+  - RELATIONSHIP FIELD: Always sets relationship when the user's phrasing
+    makes it clear ("my boss Vikram" → relationship: "boss").
+
+
+  -----------------------------------------------------------------------
+  5b. PROJECTS AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/projectsAgent.js
+  Model: claude-haiku-4-5-20251001
+  Max tokens: 800
+
+  Context received:
+  - Full projects list
+  - Task titles
+  - People names
+  - Last 3 conversation turns
+
+  Actions available:
+  - ADD_PROJECT    { name, description?, status?, goals?, _source? }
+  - UPDATE_PROJECT { name, fields: { description?, status?, goals? } }
+
+  Key behaviours:
+  - CONCEPT-LEVEL DEDUP: Matches projects by meaning, not string equality.
+    "relaxation trip with Rachy", "Goa trip", "vacation next month" are all
+    the same project. When a match is found, UPDATE the existing one with the
+    exact existing name — never create a duplicate.
+  - STATUS AUTO-UPDATE:
+      Date/timeline confirmed → "active" or "in_progress"
+      Just mentioned, no details → "planning"
+      All tasks done → "done"
+  - CANNOT touch task status — that belongs to Tasks Agent.
+
+
+  -----------------------------------------------------------------------
+  5c. PLANNING AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/planningAgent.js
+  Model: claude-haiku-4-5-20251001
+  Max tokens: 600
+
+  Context received:
+  - Pending actions from People + Projects agents (mergedEarly)
+  - Full tasks list
+  - Full projects list
+  - Last 5 conversation turns
+  - TODAY's date (injected at runtime)
+
+  Actions available:
+  - UPDATE_TASK    { title, fields: { priority?, dueDate?, notes?, tags? } }
+  - UPDATE_PROJECT { name, fields: { description? } }
+
+  Key behaviours:
+  - EXISTING TASKS ONLY: Will only UPDATE_TASK for tasks whose title already
+    exists in CURRENT TASKS. Will never infer a task title from the message
+    or pending actions. This prevents phantom UPDATE_TASK for tasks that
+    haven't been created yet.
+  - CANNOT set status on tasks or projects — stripped in code even if AI tries.
+  - DEADLINE EXTRACTION: Converts time words ("this week", "by Friday") to
+    ISO dueDate fields. Calculates from TODAY's date.
+  - PRIORITY ESCALATION:
+      Due within 7 days or blocking → high
+      Due this month → medium
+      Someday/no signal → low
+  - PRIORITY DOWNGRADE: "no rush", "pushed to next month", "deadline extended"
+    → high→medium, medium→low. Updates dueDate and notes.
+  - MOST TURNS RETURN []: Planning only acts when temporal signals are present.
+    This is expected and correct.
+  - CODE-LEVEL STATUS STRIP: Even if the AI generates a status field, the
+    stripStatus() function in planningAgent.js removes it before returning.
+
+
+  -----------------------------------------------------------------------
+  5d. TASKS AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/tasksAgent.js
+  Model: claude-sonnet-4-6
+  Max tokens: 1500  (increased from 800 to prevent truncated JSON)
+
+  Context received:
+  - Full current tasks
+  - Known project names
+  - Known people names
+  - Domain reasoning from People, Projects, Planning agents
+  - Pending actions from earlier agents
+  - Pending inquiry (active question, if any)
+  - Last 3 conversation turns
+  - TODAY's date (injected at runtime)
+
+  Actions available:
+  - ADD_TASK    { title, project?, priority?, dueDate?, tags?, notes?, _source? }
+  - UPDATE_TASK { title, fields: { status?, project?, priority?, dueDate?, tags?, notes? } }
+
+  Key behaviours:
+  - READS ALL DOMAIN REASONING: Explicitly told to read what People, Projects,
+    and Planning concluded. If Planning's reasoning says "urgent, this week",
+    the Tasks Agent sets priority: "high" in ADD_TASK — even if Planning
+    returned no actions.
+  - DEADLINE EXTRACTION: Extracts dueDate as ISO field. Backed by code-level
+    fallback function extractDueDate() that parses month+day patterns from
+    notes/title text when the AI omits the field.
+  - TASK COMPLETION DETECTION:
+      "done with X", "finished X", "sorted the X" → UPDATE_TASK status: "done"
+      Fuzzy-matches against existing task titles.
+      If no match found → reasoning set to "AMBIGUOUS_COMPLETION: ..."
+      which signals Composer to ask for clarification.
+  - DEADLINE CHANGES: "X pushed to Y" → UPDATE_TASK on existing task.
+      If no matching task found → "AMBIGUOUS_UPDATE: ..." in reasoning.
+  - PENDING INQUIRY ANSWERS: If a question was pending and the user's message
+    answers it, executes the intended action using that answer.
+  - PRIORITY DEFAULT: Always sets priority. Default when no signal: "medium".
+  - CANNOT generate ASK, CLEAR_ASK, ADD_PERSON, ADD_PROJECT.
+
+  CODE-LEVEL extractDueDate() function:
+  Runs after the AI response. Checks if dueDate is missing on any ADD_TASK or
+  UPDATE_TASK action. If missing, scans the combined text of rawMessage +
+  notes + title for:
+    1. ISO date pattern: YYYY-MM-DD
+    2. Month name + day: "April 10", "Apr 10 2026", "10 April"
+  If found, injects dueDate into the action payload before returning.
+
+
+  -----------------------------------------------------------------------
+  5e. COMPOSER AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/composerAgent.js
+  Model: claude-sonnet-4-6
+  Max tokens: 1000
+
+  Context received:
+  - All final domain actions (merged, with ASK stripped)
+  - All domain agent reasoning strings
+  - Pending inquiry (current question and round)
+  - Last 5 conversation turns
+
+  Output:
+  - reply: string (1-2 sentences)
+  - askAction: { question, context } | null
+
+  Key behaviours:
+  - SOLE ASK OWNER: The only agent in the entire pipeline that can generate
+    a question. All other agents are explicitly forbidden.
+  - REPLY FORMAT: 1-2 sentences max. Must mention at least one specific
+    name or title. Never just "Got it." or "Done."
+  - MANDATORY ASK: If any ADD_PERSON action has a name that is a relationship
+    label (Sister, Brother, Girlfriend, Boss, Friend, etc.) → MUST ask for
+    the real name, even at clarificationRound 1. Only skips at round 2.
+  - AMBIGUITY ASK: If domain reasoning contains "AMBIGUOUS_COMPLETION" or
+    "AMBIGUOUS_UPDATE" → MUST ask to identify the correct task, including
+    candidate names in the question.
+  - NO RE-ASK: Never asks about something already answered in HISTORY.
+  - BUDGET ENFORCEMENT: If clarificationRound >= 2 → askAction must be null.
+  - STRICT CONTEXT: Reply must only reference facts present in FINAL ACTIONS,
+    DOMAIN REASONING, or HISTORY. Never invents details.
+
+
+  -----------------------------------------------------------------------
+  5f. RECOMMENDATIONS AGENT
+  -----------------------------------------------------------------------
+  File: backend/agents/recommendationsAgent.js
+  Model: claude-haiku-4-5-20251001
+  Max tokens: 1000
+  Trigger: Cron (9am + 6pm daily), not part of the message pipeline
+
+  Context received:
+  - All current tasks
+  - All current projects
+  - All current people
+  - Existing active recommendations (to avoid duplicates)
+  - TODAY's date
+
+  Output:
+  - Array of recommendation objects with insight, suggestion, priority, followUpDays
+
+  Key behaviours:
+  - DEADLINE AWARENESS: Reads dueDate field directly (not just notes text).
+      Overdue → always high priority recommendation
+      Due within 3 days → high
+      Due within 7 days → medium
+  - SPOT RISKS: Deadlines approaching with no progress, idle projects, blockers
+  - SPOT GAPS: Project with no tasks, person involved in project but nothing tracked
+  - SPOT OPPORTUNITIES: Completed milestone → next phase can start
+  - ESCALATION: Items that pass their followUpAt date are escalated
+    (escalationLevel increments, followUpAt pushed 2 days forward)
+  - AUTO-RESOLVE: If a recommendation's linked task is marked done, the
+    recommendation status becomes "resolved"
+  - SKIP IF EMPTY: Does not run if all three data sources are empty
+
+
+================================================================================
+  7. THE ASK / DEFERRED ACTIONS FLOW
+================================================================================
+
+This is the mechanism that prevents saving incorrect or incomplete data.
+
+  HOW IT WORKS:
+
+  When Composer decides to ask a question, the orchestrator generates an ASK
+  action. The frontend detects this and:
+
+  1. Separates "meta actions" (ASK, CLEAR_ASK) from "data actions"
+     (ADD_TASK, ADD_PERSON, etc.)
+  2. Calls POST /api/message/confirm with:
+     - actions: meta actions only (the ASK)
+     - deferredActions: data actions (held for later)
+     - skipHistory: false
+
+  3. The confirm route executes the ASK action → saves to pendingInquiry.json
+  4. The confirm route sees deferredActions → attaches them to pendingInquiry.json
+
+  On the NEXT turn (user answers the question):
+
+  1. Message goes through the full pipeline again
+  2. CLEAR_ASK appears in the new actions (Composer sees the question was answered)
+  3. The confirm route sees hasClearAsk = true
+  4. Loads pendingInquiry.json → retrieves deferredActions
+  5. Prepends deferredActions to current actions
+  6. Executes everything together
+  7. CLEAR_ASK wipes pendingInquiry.json
+
+  RESULT: The data from Turn 1 is only saved when Turn 2 provides the answer.
+
+  FRONTEND LOGIC (in sendMessage()):
+  - Checks if any action is type ASK
+  - If ASK present: runConfirm(msg, reply, metaActions, el, false, dataActions)
+  - If no ASK: runConfirm(msg, reply, allActions, el)
+
+
+================================================================================
+  8. ACTION EXECUTION
+================================================================================
+
+File: backend/services/actionExecutor.js
+
+Receives the final merged action list and executes each in order against
+the JSON data files, then asynchronously syncs to Qdrant.
+
+  ACTION TYPES:
+
+  ADD_TASK / ADD_PERSON / ADD_PROJECT
+  - Checks for exact match by name/title (case-insensitive)
+  - Falls back to fuzzy match (Jaccard similarity, 40% threshold)
+  - For ADD_PERSON: also checks by relationship field
+  - If match found → merges fields (UPDATE behaviour)
+  - If no match → creates new record with uuid
+
+  UPDATE_TASK / UPDATE_PERSON / UPDATE_PROJECT
+  - Exact match first
+  - Fuzzy match fallback
+  - Relationship match fallback (people only)
+  - If still not found → creates as fallback (logs warning)
+  - completedAt is set when status transitions to "done"
+
+  ASK
+  - Writes question, context, clarificationRound, createdAt to pendingInquiry.json
+
+  CLEAR_ASK
+  - Writes null to pendingInquiry.json
+
+  MERGE BEHAVIOUR (mergeFields function):
+  - Never overwrites id or createdAt
+  - Skips null, undefined, empty string values
+  - Always updates updatedAt
+  - Incoming non-null fields overwrite existing
+
+  QDRANT SYNC:
+  - Fire-and-forget: does not block execution
+  - Builds embedding text from key fields per collection type:
+      tasks:    title + notes + project + tags
+      projects: name + description + goals
+      people:   name + role + relationship + notes
+  - A Qdrant sync failure never causes the action to fail
+
+
+================================================================================
+  9. DEDUPLICATION STRATEGY
+================================================================================
+
+Deduplication runs in two places: agent prompts and action executor.
+
+  IN AGENTS (prompt-level):
+  - People agent: scan by name AND relationship before ADD_PERSON
+  - Projects agent: match by MEANING not string — "Goa trip" = "vacation next month"
+  - Tasks agent: check CURRENT TASKS titles before ADD_TASK
+
+  IN EXECUTOR (code-level, last line of defence):
+  Fuzzy match using Jaccard similarity on meaningful words:
+
+    function fuzzyMatch(a, b):
+      tokenize(str) → lowercase words, length > 1, excluding stop words
+      intersection / union >= 0.4 → match
+
+  Stop words excluded: a, an, the, with, to, for, of, in, on, at, and, or,
+                       my, our, i, we
+
+  For people specifically: also deduplicates by relationship field. If a new
+  ADD_PERSON has relationship: "girlfriend" and a "Girlfriend" placeholder
+  exists, the executor merges rather than creates.
+
+  RESULT: Even if the AI creates a duplicate action, the executor catches it
+  and merges the fields into the existing record.
+
+
+================================================================================
+  10. DEADLINE SYSTEM
+================================================================================
+
+Three components work together for deadline management:
+
+  COMPONENT 1 — EXTRACTION (tasks agent + code fallback)
+  When a message contains a date, dueDate is set as YYYY-MM-DD.
+  The code-level extractDueDate() function in tasksAgent.js runs after every
+  AI response. It checks for missing dueDate fields and parses:
+    - ISO format: 2026-04-10
+    - Month + day: "April 10", "Apr 10 2026", "10 April"
+  If the parsed date is in the past, it assumes next year.
+
+  COMPONENT 2 — DAILY SWEEP (deadlineSweep.js, 8am)
+  No AI involved. Pure date arithmetic:
+    - daysUntil < 0 (overdue):        priority → high, prepend "Overdue since YYYY-MM-DD."
+    - daysUntil <= 2:                 priority → high, prepend "Due in N days."
+    - daysUntil <= 7 and was low:     priority → medium, prepend "Due in N days."
+    - daysUntil > 7:                  no change
+
+  Existing sweep notes are stripped before prepending new ones (regex-based)
+  to avoid accumulation across multiple sweeps.
+
+  Runs 1 hour before recommendations so that escalated priorities are already
+  in place when recommendations are generated.
+
+  COMPONENT 3 — RECOMMENDATIONS (recommendationsAgent.js, 9am + 6pm)
+  Reads dueDate field directly. Generates specific actionable recommendations:
+    - Overdue → high priority recommendation, surfaces immediately on Focus
+    - Due within 3 days → high
+    - Due within 7 days → medium
+    - Beyond 7 days → assessed by other signals (gaps, risks, opportunities)
+
+
+================================================================================
+  11. SCHEDULED JOBS (CRON)
+================================================================================
+
+File: backend/server.js (lines 50-54)
+Library: node-cron
+
+  "0 8 * * *"   → deadlineSweep.run()
+  "0 9 * * *"   → recommendationsAgent.run()
+  "0 18 * * *"  → recommendationsAgent.run()
+
+  All times are in the server's local timezone.
+
+  The 8am sweep runs before 9am recommendations intentionally. Escalated
+  priorities from the sweep are visible to the recommendations agent.
+
+  Jobs run silently if there is nothing to act on. The recommendations agent
+  skips entirely if all data sources are empty.
+
+
+================================================================================
+  12. FRONTEND — TAB STRUCTURE
+================================================================================
+
+File: frontend/index.html (single file, vanilla JS + CSS)
+
+  NAVIGATION
+  Tab order: focus | projects | chat | people | journal
+  Chat tab is the center focal point — pill styling, always visible default.
+  Other tabs use an underline indicator.
+
+  TAB: FOCUS
+  - Date and subtitle ("what requires your attention")
+  - Recommendations section (loaded from /api/recommendations)
+  - Today section: tasks due today or high priority
+  - This week section: tasks due this week
+  - This month section: remaining active tasks
+
+  TAB: PROJECTS
+  - Active projects with task lists
+  - Done projects hidden behind "view N done" toggle
+  - Each task has an ↗ button on hover → opens task in Chat tab with context
+
+  TAB: CHAT (default)
+  - Full conversation history
+  - Task context chip: when opened from a task, shows which task is in focus
+  - Input bar with send button
+  - Preview/confirm flow: AI shows intent before executing
+  - Pending inquiry panel: shows active question highlighted
+
+  TAB: PEOPLE
+  - 4 sections: family | friends | business | others
+  - Categorisation:
+      family:   sister, brother, mum, mom, mother, dad, father, wife, husband,
+                partner, grandmother, grandfather, grandma, grandpa, aunt,
+                uncle, cousin, daughter, son, niece, nephew, family
+      friends:  friend, bestfriend, best friend, flatmate, roommate
+      business: boss, manager, colleague, coworker, client, investor, mentor,
+                employee, teammate, stakeholder, vendor, business
+      others:   anything not matched above
+  - Click a person card → overlay with profile, related tasks, related projects,
+    "↗ chat about [name]" button
+
+  TAB: JOURNAL
+  - Chronological log of all conversation turns
+  - Loaded from GET /api/data/journal (raw journal.md)
+
+  SPLASH / HOME
+  - Time-based greeting: "good morning", "good afternoon", "good evening"
+  - Shown on Focus tab before scrolling
+
+  CONTEXT CHIP
+  When a task is opened in chat (via ↗ button), a chip appears above the
+  input bar showing the task name. The message is prefixed with task metadata
+  when sent to /preview:
+    [FOCUSED TASK — id: X, title: "Y", status: Z, priority: P, notes: "N"]
+    User update: <message>
+  Dismissing the chip clears the task context.
+
+
+================================================================================
+  13. API REFERENCE
+================================================================================
+
+All endpoints at http://localhost:3000/api/
+
+  POST /api/message
+  Body: { message: string }
+  Runs full pipeline and executes immediately. Used for direct sends.
+  Returns: { reply, actions, executionLog, contextSource }
+
+  POST /api/message/preview
+  Body: { message: string, taskContext?: { id, title, status, priority, notes } }
+  Interprets only — no execution, no session save.
+  Returns: { reply, actions, contextSource }
+
+  POST /api/message/confirm
+  Body: { message, reply, actions, skipHistory?, deferredActions? }
+  Executes pre-approved actions. Handles deferred action merging.
+  skipHistory: true → execute actions but do NOT record turn in session
+               (used when user cancels — prevents AI thinking cancelled
+                action happened)
+  Returns: { reply, actions: allActions, executionLog }
+
+  GET /api/data
+  Returns full context object (what contextLoader.js returns with no query).
+
+  GET /api/data/journal
+  Returns journal.md as plain text.
+
+  GET /api/data/:file
+  Allowed files: memory, projects, people, projectState, sessionContext,
+                 pendingInquiry
+  Returns parsed JSON of that data file.
+
+  GET /api/recommendations
+  Returns current recommendations.json content.
+
+  GET /api/health
+  Returns { status: "ok", time: ISO, qdrant: "ok" | "unreachable" }
+
+  GET /api/usage
+  Returns usage.json — total API calls, tokens, cost by model.
+
+
+================================================================================
+  14. FILE REFERENCE
+================================================================================
+
+  backend/server.js
+  Entry point. Loads dotenv with explicit path (../. env relative to __dirname
+  so it works regardless of cwd). Mounts routes, runs ensureCollections on
+  startup, schedules cron jobs.
+
+  backend/agents/composerAgent.js
+  Final agent. Writes user-facing reply and decides on ASK. Receives all
+  domain reasoning and final actions. Only agent that can output ASK.
+
+  backend/agents/peopleAgent.js
+  Manages people registry. Runs in parallel with projects agent.
+
+  backend/agents/projectsAgent.js
+  Manages projects registry. Runs in parallel with people agent.
+
+  backend/agents/planningAgent.js
+  Temporal intelligence. Runs after people+projects, before tasks. Only
+  updates existing tasks (enforced in both prompt and code).
+
+  backend/agents/tasksAgent.js
+  Task synthesis. Runs last among domain agents. Has extractDueDate() code
+  fallback. maxTokens: 1500 to handle large task lists.
+
+  backend/agents/recommendationsAgent.js
+  Autonomous agent. Not part of message pipeline. Runs on cron schedule.
+  Reads full data, generates proactive recommendations.
+
+  backend/agents/routerAgent.js
+  DEAD CODE — not imported anywhere. Left in place. Originally routed messages
+  to domain agents. Removed when agents proved capable of self-gating.
+
+  backend/services/orchestrator.js
+  Coordinates the pipeline. Runs people+projects in parallel, then planning,
+  tasks, composer sequentially. Strips ASK from domain agents. Manages
+  clarification round counter.
+
+  backend/services/agentContext.js
+  Pure functions that slice the full context object into agent-specific views.
+  Functions: sliceForPeople, sliceForProjects, sliceForPlanning,
+             sliceForTasks, sliceForComposer.
+
+  backend/services/contextLoader.js
+  Loads context before pipeline runs. Qdrant semantic search or full JSON
+  fallback. Always loads sessionContext and pendingInquiry.
+
+  backend/services/actionExecutor.js
+  Executes action arrays against storage. Contains mergeFields(), fuzzyMatch(),
+  resolveSource(), buildEmbeddingText(), syncToQdrant(). Handles all 7 action
+  types: ADD_TASK, UPDATE_TASK, ADD_PROJECT, UPDATE_PROJECT, ADD_PERSON,
+  UPDATE_PERSON, ASK, CLEAR_ASK.
+
+  backend/services/deadlineSweep.js
+  Cron job service. No AI. Reads active tasks with dueDate, calculates
+  daysUntil from today, escalates priority and prepends urgency note.
+  Strips previous sweep notes before prepending new ones.
+
+  backend/services/qdrantSync.js
+  Qdrant client wrapper. Uses OpenAI text-embedding-3-small for embeddings
+  (1536 dimensions, cosine similarity). Collections: tasks, projects, people,
+  journal. Functions: ensureCollections, resetCollections, upsertVector,
+  searchVectors, healthCheck.
+
+  backend/routes/message.js
+  Three endpoints: POST /, POST /preview, POST /confirm. Handles deferred
+  action merging in /confirm. Manages session history cap (SESSION_LIMIT = 10).
+
+  backend/routes/data.js
+  Read-only data endpoints. GET / returns full context. GET /journal returns
+  raw markdown. GET /:file returns a specific data file.
+
+  backend/routes/recommendations.js
+  GET / returns current recommendations.json.
+
+  backend/utils/callAI.js
+  Anthropic API wrapper. Sends system + userPrompt to specified model. Parses
+  JSON response (strips markdown code fences). Tracks usage to usage.json.
+  Models and pricing: sonnet-4-6 ($3/$15 per M tokens), haiku-4-5 ($0.80/$4).
+
+  backend/utils/storage.js
+  readJson(filename) / writeJson(filename, data). All paths resolve to DATA_DIR
+  (defaults to ./data). readJson returns safe defaults on ENOENT.
+
+  backend/utils/journal.js
+  appendJournal({ message, reply, actions, executionLog }). Appends a formatted
+  entry to data/journal.md with timestamp, user/assistant exchange, and action
+  summary.
+
+  frontend/index.html
+  Complete single-page app. CSS variables for theming (--accent: #d4aa6a).
+  Typography: Syne (headings), DM Sans (body), EB Garamond (serif), JetBrains
+  Mono (code/labels). All state managed in-memory via _data and _taskContext.
+  Polls no endpoints — all data fetched on load and after each message.
+
+  data/memory.json           Tasks store
+  data/projects.json         Projects store
+  data/people.json           People store
+  data/sessionContext.json   Last 10 conversation turns
+  data/pendingInquiry.json   Active follow-up question (null when none)
+  data/recommendations.json  AI-generated recommendations
+  data/usage.json            API usage and cost tracking
+  data/journal.md            Append-only conversation log (markdown)
+  data/projectState.json     Legacy file, kept for compatibility
+
+  scripts/reset-qdrant.js
+  Calls resetCollections() from qdrantSync — deletes and recreates all four
+  Qdrant collections. Run with: node scripts/reset-qdrant.js
+
+
+================================================================================
+  15. ENVIRONMENT VARIABLES
+================================================================================
+
+  ANTHROPIC_API_KEY   Required. Used in callAI.js for all agent calls.
+  OPENAI_API_KEY      Required. Used in qdrantSync.js for embeddings only.
+  QDRANT_URL          Optional. Defaults to http://localhost:6333
+  PORT                Optional. Defaults to 3000
+  DATA_DIR            Optional. Defaults to ./data (relative to cwd)
+
+  The .env file must be in the project root (same level as package.json).
+  server.js loads it with: require("dotenv").config({ path: require("path")
+  .join(__dirname, "../.env") }) — uses __dirname so it works regardless of
+  the directory the server is started from.
+
+
+================================================================================
+  16. KEY CONSTANTS AND TUNING PARAMETERS
+================================================================================
+
+  SESSION_LIMIT = 10
+  File: backend/routes/message.js:9
+  Maximum conversation turns kept in sessionContext.json. Older turns are
+  dropped. Affects how much recent history each agent can see.
+
+  Qdrant search limits: 8, 5, 5
+  File: backend/services/contextLoader.js:14-16
+  tasks=8, projects=5, people=5. How many records come from semantic search.
+  Increase for better recall, decrease to reduce token usage.
+
+  History slices per agent:
+  - People agent:    last 3 turns  (agentContext.js:6)
+  - Projects agent:  last 3 turns  (agentContext.js:15)
+  - Planning agent:  last 5 turns  (agentContext.js:23)
+  - Tasks agent:     last 3 turns  (agentContext.js:33)
+  - Composer agent:  last 5 turns  (agentContext.js:49)
+
+  Clarification budget: 2
+  File: backend/services/orchestrator.js:54
+  "currentRound < 2" — Composer forbidden from asking if round >= 2.
+
+  Fuzzy match threshold: 0.4 (40% Jaccard)
+  File: backend/services/actionExecutor.js:29
+  Lower → more aggressive dedup (may merge different items)
+  Higher → less dedup (may allow near-duplicates)
+
+  Deadline sweep thresholds:
+  File: backend/services/deadlineSweep.js
+  daysUntil < 0    → overdue → high priority
+  daysUntil <= 2   → due soon → high priority
+  daysUntil <= 7   → approaching (if currently low) → medium priority
+
+  maxTokens per agent:
+  - peopleAgent:    800   (default)
+  - projectsAgent:  800   (default)
+  - planningAgent:  600   (planning usually returns small responses)
+  - tasksAgent:     1500  (needs room for multiple task payloads)
+  - composerAgent:  1000  (reply + askAction)
+  - recommendations: 1000
+
+
+================================================================================
+  17. DATA PRIVACY
+================================================================================
+
+  LOCAL:
+  - All data files (memory.json, projects.json, people.json, etc.)
+  - Qdrant vector database (runs in local Docker container)
+  - The Node.js server and frontend
+
+  LEAVES THE MACHINE:
+  - Every message + relevant context → Anthropic API (for AI processing)
+  - Embedding text (task/project/person summaries) → OpenAI API (for vectors)
+
+  Anthropic and OpenAI data retention and privacy policies apply.
+
+  TO MAKE FULLY LOCAL:
+  1. Replace backend/utils/callAI.js to call a local model API
+     (Ollama: http://localhost:11434/api, LM Studio: http://localhost:1234/v1)
+  2. Replace the embed() function in backend/services/qdrantSync.js with a
+     local embedding model (e.g. nomic-embed-text via Ollama)
+     Update VECTOR_SIZE if the local model uses a different dimension.
+
+  Trade-off: local models (Llama 3, Mistral) produce significantly lower
+  quality multi-step reasoning compared to Claude Sonnet. Agent accuracy,
+  deduplication, and context understanding will degrade.
+
+
+================================================================================
+  18. KNOWN BEHAVIOURS AND EDGE CASES
+================================================================================
+
+  PLANNING AGENT UPDATE_PROJECT OVERLAP
+  When a new project is created with urgency language in the same message,
+  the projects agent creates it and the planning agent may also emit an
+  UPDATE_PROJECT for the same project (adding date to description). The
+  executor handles this gracefully (create then update). No duplicates form.
+  Not worth fixing — harmless.
+
+  QDRANT BLEEDING BETWEEN TEST RUNS
+  When JSON files are wiped but Qdrant is not reset, semantic search returns
+  records from previous test data. These records are then processed by agents
+  as if they exist in current context. Always reset both together when doing
+  clean tests: wipe JSON files + run node scripts/reset-qdrant.js
+
+  DUEDATE ON COMPLETION
+  When a task is marked done, the tasks agent sometimes sets dueDate to today's
+  date. This overwrites the original deadline. Does not affect behaviour (done
+  tasks are excluded from sweep and recommendations) but is slightly inaccurate
+  for historical records.
+
+  DUPLICATE UPDATE_TASK FROM PLANNING + TASKS
+  On rare occasions both planning and tasks agents emit UPDATE_TASK for the
+  same existing task (e.g. a deadline change). The executor applies both,
+  with the tasks agent's action winning (it runs last). Not harmful but
+  creates minor redundancy in the execution log.
+
+  AMBIGUOUS COMPLETION RARELY FIRES
+  The AMBIGUOUS_COMPLETION path only fires when the tasks agent finds zero
+  matches in current tasks. Claude Sonnet is capable enough to resolve most
+  vague references ("that thing with Karan" → "Sync with Karan on decoration
+  plans") without needing clarification. The flow works correctly when there
+  truly is no match.
+
+  SERVER MUST START FROM PROJECT ROOT
+  server.js uses __dirname-relative dotenv path which resolves correctly
+  regardless of cwd. However, DATA_DIR defaults to "./data" (relative to cwd),
+  so if started from a subdirectory, data files won't be found. Always start
+  with: cd /path/to/second-brain-os && node backend/server.js (or npm start).
+
+  ROUTER AGENT FILE
+  backend/agents/routerAgent.js exists but is not imported anywhere.
+  It is dead code from an earlier architecture. Safe to delete but harmless
+  to leave.
+
+================================================================================
+  END OF DOCUMENTATION
+================================================================================
